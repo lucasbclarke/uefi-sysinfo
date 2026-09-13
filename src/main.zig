@@ -1,6 +1,7 @@
 const std = @import("std");
 const uefi = std.os.uefi;
 const GraphicsOutput = uefi.protocol.GraphicsOutput;
+const scale: usize = 2;
 
 const glyphs = [95][8]u8{
     // 32 space
@@ -202,22 +203,40 @@ fn fontGet(c: u8) [8]u8 {
 
 fn drawChar(g: *GraphicsOutput, x: usize, y: usize, ch: u8, fg: GraphicsOutput.BltPixel) void {
     const glyph = fontGet(ch);
-    var buf: [8*8]GraphicsOutput.BltPixel = undefined;
+    const cell = 8 * scale;
+    var buf: [32*32]GraphicsOutput.BltPixel = undefined;
+        
+    const black = GraphicsOutput.BltPixel{ .blue = 0, .green = 0, .red = 0 };
+    var i: usize = 0;
+    while (i < cell * cell) : (i += 1) buf[i] = black;
+
     var row: usize = 0;
     while (row < 8) : (row += 1) {
         var col: usize = 0;
         while (col < 8) : (col += 1) {
             const on = (glyph[row] & (@as(u8, 1) << @intCast(col))) != 0;
-            buf[row * 8 + col] = if (on) fg else .{ .blue = 0, .green = 0, .red = 0};
+            //buf[row * 8 + col] = if (on) fg else .{ .blue = 0, .green = 0, .red = 0};
+            if (!on) continue;
+
+            var dy: usize = 0;
+            while (dy < scale) : (dy += 1) {
+                var dx: usize = 0;
+                while (dx < scale) : (dx += 1) {
+                    const px = col * scale + dx;
+                    const py = row * scale + dy;
+                    buf[py * cell + px] = fg;
+                }
+            }
         }
     }
-    _ = g.blt(&buf, .blt_buffer_to_video, 0, 0, x, y, 8, 8, 0);
+    _ = g.blt(&buf, .blt_buffer_to_video, 0, 0, x, y, cell, cell, 0);
 }
 
 fn drawText(g: *GraphicsOutput, x: usize, y: usize, text: []const u8, fg: GraphicsOutput.BltPixel) void {
+    const step = 8 * scale;
     var i: usize = 0;
     for (text) |c| {
-        drawChar(g, x + i * 8, y, c, fg);
+        drawChar(g, x + i * step, y, c, fg);
         i += 1;
     }
 }
@@ -229,6 +248,23 @@ fn utf16toAscii(src: [*:0]const u16, dst: []u8) []const u8 {
         dst[i] = if (c < 128) @truncate(c) else '?'; 
     }
     return dst[0..i];
+}
+
+fn cpuid (leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [sub] "{ecx}" (sub),
+    );
+
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
 pub fn main() uefi.Status {
@@ -251,11 +287,15 @@ pub fn main() uefi.Status {
     const vendor16 = st.firmware_vendor;
     const rev = st.firmware_revision;
 
+    const line_h = 8 * scale + 8;
+    var y: usize = 40;
+
     var bg = GraphicsOutput.BltPixel{ .blue = 0, .green = 0, .red = 0 };
     _ = g.blt(@ptrCast(&bg), .blt_video_fill, 0, 0, 0, 0, w, h, 0);
 
     const fg = GraphicsOutput.BltPixel{ .blue = 255, .green = 255, .red = 255 };
-    drawText(g, 40, 40, "This is a much longer sample message to make sure the graphics don't break when it's really long", fg);
+    drawText(g, 40, y, "This is a much longer sample message to make sure the graphics don't break when it's really long", fg);
+    y += line_h;
 
     var vbuf: [64]u8 = undefined;
     const vendor = utf16toAscii(vendor16, &vbuf);
@@ -263,17 +303,75 @@ pub fn main() uefi.Status {
     var rbuf: [20]u8 = undefined;
     const rev_str = std.fmt.bufPrint(&rbuf, "rev {x}", .{rev}) catch "rev ?";
 
-    drawText(g, 40, 88, vendor, fg);
-    drawText(g, 40, 104, rev_str, fg);
+    drawText(g, 40, y, vendor, fg);
+    y += line_h;
+    drawText(g, 40, y, rev_str, fg);
+    y += line_h;
 
     var line: [32]u8 = undefined;
     const res = std.fmt.bufPrint(&line, "{d}x{d}", .{w, h}) catch "err";
-    drawText(g, 40, 56, res, fg);
+    drawText(g, 40, y, res, fg);
+    y += line_h;
 
     var fill = GraphicsOutput.BltPixel{ .blue = 0, .green = 0, .red = 255 };
     var box = GraphicsOutput.BltPixel{ .blue = 255, .green = 180, .red = 0 };
 
     var key: uefi.protocol.SimpleTextInput.Key.Input = undefined;
+
+    var map_size: usize = 0;
+    var map_key: usize = undefined;
+    var desc_size: usize = 0;
+    var desc_version: u32 = undefined;
+
+    _ = bs.getMemoryMap(&map_size, null, &map_key, &desc_size, &desc_version);
+    map_size += 2 * desc_size;
+
+    var map_buf: [*]align(8) u8 = undefined;
+    if (bs.allocatePool(.loader_data, map_size, @ptrCast(&map_buf)) != .success) {
+        return .out_of_resources;
+    }
+
+    if (bs.getMemoryMap(&map_size, @ptrCast(map_buf), &map_key, &desc_size, &desc_version) != .success) {
+        _ = bs.freePool(map_buf);
+        return .load_error;
+    }
+
+    var total: u64 = 0;
+    var off: usize = 0;
+    while (off + desc_size <= map_size) : (off += desc_size) {
+        const d: *uefi.tables.MemoryDescriptor = @ptrCast(@alignCast(map_buf + off));
+        if (d.type == .conventional_memory) {
+            total += d.number_of_pages * 4096;
+        }
+    }
+    _ = bs.freePool(map_buf);
+
+    var mbuf: [32]u8 = undefined;
+    const mem_str = blk: {
+        if (total >= 1 << 30) {
+            break :blk std.fmt.bufPrint(&mbuf, "RAM {d} MiB", .{total >> 20}) catch "RAM ?";
+        } else {
+            break :blk std.fmt.bufPrint(&mbuf, "RAM {d} KiB", .{total >> 10}) catch "RAM ?";
+        }
+    };
+    drawText(g, 40, y, mem_str, fg);
+    y += line_h;
+
+    var brand: [48]u8 = undefined;
+    @memset(&brand, 0);
+
+    inline for ( .{ 0x80000002, 0x80000003, 0x80000004 }, 0..) |leaf, part| {
+        const r = cpuid(leaf, 0);
+        const offset = part * 16;
+        @memcpy(brand[offset .. offset + 4], std.mem.asBytes(&r.eax));
+        @memcpy(brand[offset + 4 .. offset + 8], std.mem.asBytes(&r.ebx));
+        @memcpy(brand[offset + 8 .. offset + 12], std.mem.asBytes(&r.ecx));
+        @memcpy(brand[offset + 12 .. offset + 16], std.mem.asBytes(&r.edx));
+    }
+
+    const brand_str = std.mem.trim(u8, &brand, &[_]u8{0, ' '});
+    drawText(g, 40, y, brand_str, fg);
+    y += line_h;
 
     while (true) {
 
@@ -283,48 +381,10 @@ pub fn main() uefi.Status {
         var tbuf: [16]u8 = undefined;
         const tstr = std.fmt.bufPrint(&tbuf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ time.hour, time.minute, time.second }) catch "??:??:??";
 
-        var map_size: usize = 0;
-        var map_key: usize = undefined;
-        var desc_size: usize = 0;
-        var desc_version: u32 = undefined;
-
-        _ = bs.getMemoryMap(&map_size, null, &map_key, &desc_size, &desc_version);
-        map_size += 2 * desc_size;
-
-        var map_buf: [*]align(8) u8 = undefined;
-        if (bs.allocatePool(.loader_data, map_size, @ptrCast(&map_buf)) != .success) {
-            return .out_of_resources;
-        }
-
-        if (bs.getMemoryMap(&map_size, @ptrCast(map_buf), &map_key, &desc_size, &desc_version) != .success) {
-            _ = bs.freePool(map_buf);
-            return .load_error;
-        }
-
-        var total: u64 = 0;
-        var off: usize = 0;
-        while (off + desc_size <= map_size) : (off += desc_size) {
-            const d: *uefi.tables.MemoryDescriptor = @ptrCast(@alignCast(map_buf + off));
-            if (d.type == .conventional_memory) {
-                total += d.number_of_pages * 4096;
-            }
-        }
-        _ = bs.freePool(map_buf);
-
-        var mbuf: [32]u8 = undefined;
-        const mem_str = blk: {
-            if (total >= 1 << 30) {
-                break :blk std.fmt.bufPrint(&mbuf, "RAM {d} MiB", .{total >> 20}) catch "RAM ?";
-            } else {
-                break :blk std.fmt.bufPrint(&mbuf, "RAM {d} KiB", .{total >> 10}) catch "RAM ?";
-            }
-        };
-        drawText(g, 40, 120, mem_str, fg);
-
-
         var black = GraphicsOutput.BltPixel{ .blue = 0, .green = 0, .red = 0 };
-        _ = g.blt(@ptrCast(&black), .blt_video_fill, 0, 0, 40, 72, 8 * 8, 8, 0);
-        drawText(g, 40, 72, tstr, fg);
+        const step = 8 * scale;
+        _ = g.blt(@ptrCast(&black), .blt_video_fill, 0, 0, 40, 72, step * 8, step, 0);
+        drawText(g, 40, y, tstr, fg);
 
         const deadline = 10;
         var i: usize = 0;

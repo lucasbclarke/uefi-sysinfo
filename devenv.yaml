@@ -1,0 +1,12 @@
+inputs:
+  devenv:
+    url: github:cachix/devenv/v2.3
+  zig-overlay:
+    url: github:mitchellh/zig-overlay
+  zls:
+    url: github:zigtools/zls/0.16.0
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+      zig-overlay:
+        follows: zig-overlay

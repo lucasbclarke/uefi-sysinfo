@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-OUT=$(nix build --no-link --print-out-paths)
-cp "$OUT/bin/uefi_zig.efi" esp/EFI/BOOT/BOOTX64.EFI
+zig build
+cp zig-out/bin/uefi_zig.efi esp/EFI/BOOT/BOOTX64.EFI
 
 OVMF=$(nix build nixpkgs#OVMF.fd --no-link --print-out-paths)
 #qemu-system-x86_64 \

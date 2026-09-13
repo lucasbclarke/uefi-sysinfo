@@ -1,4 +1,6 @@
 .zig-cache
+.devenv
+devenv.lock
 zig-out
 OVMF_VARS.fd
 esp
